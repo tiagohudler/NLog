@@ -38,6 +38,7 @@ namespace NLog.Targets.Wrappers
     using System.Threading;
     using NLog.Common;
     using NLog.Internal;
+    using NLog.Targets.Dispatchers;
 
     /// <summary>
     /// Provides asynchronous, buffered execution of target writes.
@@ -81,7 +82,7 @@ namespace NLog.Targets.Wrappers
     {
         private readonly object _writeLockObject = new object();
         private readonly object _timerLockObject = new object();
-        private Timer? _lazyWriterTimer;
+        private IDispatcher? _lazyWriterDispatcher;
         private readonly ReusableAsyncLogEventList _reusableAsyncLogEventList = new ReusableAsyncLogEventList(200);
         private readonly WaitCallback _flushEventsInQueueDelegate;
         private event EventHandler<LogEventDroppedEventArgs>? _logEventDroppedEvent;
@@ -245,6 +246,11 @@ namespace NLog.Targets.Wrappers
         private bool? _forceLockingQueue;
 
         /// <summary>
+        /// Creates the <see cref="IDispatcher"/> that schedules the background writer. A new dispatcher is created on every initialize.
+        /// </summary>
+        internal Func<IDispatcher> DispatcherFactory { get; set; } = () => new TimerDispatcher();
+
+        /// <summary>
         /// Gets the queue of lazy writer thread requests.
         /// </summary>
         AsyncRequestQueueBase _requestQueue;
@@ -292,7 +298,9 @@ namespace NLog.Targets.Wrappers
 
             _requestQueue.Clear();
             InternalLogger.Trace("{0}: Start Timer", this);
-            _lazyWriterTimer = new Timer(ProcessPendingEvents, null, Timeout.Infinite, Timeout.Infinite);
+            var dispatcher = DispatcherFactory();
+            dispatcher.Set(ProcessPendingEvents);
+            _lazyWriterDispatcher = dispatcher;
             StartLazyWriterTimer();
         }
 
@@ -342,7 +350,7 @@ namespace NLog.Targets.Wrappers
             {
                 lock (_timerLockObject)
                 {
-                    _lazyWriterTimer?.Change(TimeToSleepBetweenBatches, Timeout.Infinite);
+                    _lazyWriterDispatcher?.Change(TimeToSleepBetweenBatches, Timeout.Infinite);
                 }
             }
         }
@@ -388,17 +396,18 @@ namespace NLog.Targets.Wrappers
         {
             lock (_timerLockObject)
             {
-                if (_lazyWriterTimer != null)
+                var dispatcher = _lazyWriterDispatcher;
+                if (dispatcher != null)
                 {
                     if (instant)
                     {
                         InternalLogger.Trace("{0}: Timer scheduled instantly", this);
-                        _lazyWriterTimer.Change(0, Timeout.Infinite);
+                        dispatcher.Change(0, Timeout.Infinite);
                     }
                     else
                     {
                         InternalLogger.Trace("{0}: Timer scheduled throttled", this);
-                        _lazyWriterTimer.Change(1, Timeout.Infinite);
+                        dispatcher.Change(1, Timeout.Infinite);
                     }
                     return true;
                 }
@@ -412,15 +421,14 @@ namespace NLog.Targets.Wrappers
         /// </summary>
         protected virtual void StopLazyWriterThread()
         {
+            IDispatcher? currentDispatcher;
             lock (_timerLockObject)
             {
-                var currentTimer = _lazyWriterTimer;
-                if (currentTimer != null)
-                {
-                    _lazyWriterTimer = null;
-                    currentTimer.WaitForDispose(TimeSpan.FromSeconds(1));
-                }
+                currentDispatcher = _lazyWriterDispatcher;
+                _lazyWriterDispatcher = null;
             }
+
+            currentDispatcher?.Stop(TimeSpan.FromSeconds(1));
         }
 
         /// <summary>
@@ -466,9 +474,9 @@ namespace NLog.Targets.Wrappers
             }
         }
 
-        private void ProcessPendingEvents(object? state)
+        private void ProcessPendingEvents()
         {
-            if (_lazyWriterTimer is null)
+            if (_lazyWriterDispatcher is null)
                 return;
 
             bool wroteFullBatchSize = false;
