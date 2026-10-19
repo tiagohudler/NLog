@@ -65,6 +65,22 @@ namespace NLog.Targets.Wrappers
     ///    ... your targets go here ...
     /// </targets>
     /// ]]></code>
+    /// <p>
+    /// By default the queue is written from a timer callback on the .NET ThreadPool. Set dispatcher="DedicatedThread"
+    /// to write from a dedicated background thread instead, so logging keeps working when the ThreadPool is starved.
+    /// This costs one thread per target. To apply it to all targets, use &lt;default-wrapper&gt;:
+    /// </p>
+    /// <code lang="XML">
+    /// <![CDATA[
+    /// <targets>
+    ///    <default-wrapper xsi:type="AsyncWrapper" overflowAction="Block" dispatcher="DedicatedThread" />
+    ///    ... your targets go here ...
+    /// </targets>
+    /// ]]></code>
+    /// <p>
+    /// Don't combine it with async="true". That puts a second AsyncWrapper with default settings between
+    /// the &lt;default-wrapper&gt; and each target, and that inner wrapper still writes from the ThreadPool.
+    /// </p>
     /// </remarks>
     /// <example>
     /// <p>
@@ -246,9 +262,21 @@ namespace NLog.Targets.Wrappers
         private bool? _forceLockingQueue;
 
         /// <summary>
-        /// Creates the <see cref="IDispatcher"/> that schedules the background writer. A new dispatcher is created on every initialize.
+        /// Gets or sets where the background writer runs: on the .NET ThreadPool, or on a dedicated thread owned by this target.
         /// </summary>
-        internal Func<IDispatcher> DispatcherFactory { get; set; } = () => new TimerDispatcher();
+        /// <remarks>
+        /// Default: <see cref="AsyncTargetWrapperDispatcher.ThreadPool"/> .
+        /// Use <see cref="AsyncTargetWrapperDispatcher.DedicatedThread"/> to keep writing when the .NET ThreadPool is starved,
+        /// which matters most with <see cref="AsyncTargetWrapperOverflowAction.Block"/>. Costs one thread per target.
+        /// Applied when the target is initialized.
+        /// </remarks>
+        /// <docgen category='Buffering Options' order='100' />
+        public AsyncTargetWrapperDispatcher Dispatcher { get; set; }
+
+        /// <summary>
+        /// Overrides <see cref="Dispatcher"/> with a custom <see cref="IDispatcher"/>. A new dispatcher is created on every initialize.
+        /// </summary>
+        internal Func<IDispatcher>? DispatcherFactory { get; set; }
 
         /// <summary>
         /// Gets the queue of lazy writer thread requests.
@@ -298,10 +326,39 @@ namespace NLog.Targets.Wrappers
 
             _requestQueue.Clear();
             InternalLogger.Trace("{0}: Start Timer", this);
-            var dispatcher = DispatcherFactory();
+            var dispatcher = CreateDispatcher();
             dispatcher.Set(ProcessPendingEvents);
-            _lazyWriterDispatcher = dispatcher;
-            StartLazyWriterTimer();
+            IDispatcher? previousDispatcher;
+            lock (_timerLockObject)
+            {
+                previousDispatcher = _lazyWriterDispatcher;
+                _lazyWriterDispatcher = dispatcher;
+            }
+
+            // Still running when a subclass skipped StopLazyWriterThread on close. A dedicated thread would otherwise leak.
+            previousDispatcher?.Stop(TimeSpan.Zero);
+
+            try
+            {
+                StartLazyWriterTimer();
+            }
+            catch
+            {
+                // Target.Close skips CloseTarget after failed initialize, so stop the dispatcher here
+                StopLazyWriterDispatcher(TimeSpan.Zero);
+                throw;
+            }
+        }
+
+        private IDispatcher CreateDispatcher()
+        {
+            if (DispatcherFactory != null)
+                return DispatcherFactory();
+
+            if (Dispatcher == AsyncTargetWrapperDispatcher.DedicatedThread)
+                return new DedicatedThreadDispatcher("NLog AsyncWrapper " + Name);
+
+            return new TimerDispatcher();
         }
 
         /// <summary>
@@ -421,6 +478,11 @@ namespace NLog.Targets.Wrappers
         /// </summary>
         protected virtual void StopLazyWriterThread()
         {
+            StopLazyWriterDispatcher(TimeSpan.FromSeconds(1));
+        }
+
+        private void StopLazyWriterDispatcher(TimeSpan timeout)
+        {
             IDispatcher? currentDispatcher;
             lock (_timerLockObject)
             {
@@ -428,7 +490,7 @@ namespace NLog.Targets.Wrappers
                 _lazyWriterDispatcher = null;
             }
 
-            currentDispatcher?.Stop(TimeSpan.FromSeconds(1));
+            currentDispatcher?.Stop(timeout);
         }
 
         /// <summary>
