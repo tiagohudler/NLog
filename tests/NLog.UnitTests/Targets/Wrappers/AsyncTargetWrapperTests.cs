@@ -39,7 +39,6 @@ namespace NLog.UnitTests.Targets.Wrappers
     using NLog.Common;
     using NLog.Config;
     using NLog.Targets;
-    using NLog.Targets.Dispatchers;
     using NLog.Targets.Wrappers;
     using Xunit;
 
@@ -1006,11 +1005,11 @@ namespace NLog.UnitTests.Targets.Wrappers
         }
 
         [Fact]
-        public void Initialize_WhenReaderStartFails_StopsReader()
+        public void Initialize_WhenChannelStartFails_StopsChannel()
         {
-            RecordingReader reader = null;
-            var targetWrapper = new AsyncTargetWrapper(new MyTarget()) { Name = "Initialize_WhenReaderStartFails_Wrapper" };
-            targetWrapper.ReaderFactory = (consume, timeToSleepBetweenBatches) => reader = new RecordingReader(consume, timeToSleepBetweenBatches) { ThrowOnStart = true };
+            RecordingChannel channel = null;
+            var targetWrapper = new AsyncTargetWrapper(new MyTarget()) { Name = "Initialize_WhenChannelStartFails_Wrapper" };
+            targetWrapper.ChannelFactory = consume => channel = new RecordingChannel(consume) { ThrowOnStart = true };
 
             using (new NoThrowNLogExceptions())
             {
@@ -1018,36 +1017,34 @@ namespace NLog.UnitTests.Targets.Wrappers
                 targetWrapper.Close();
             }
 
-            Assert.NotNull(reader);
-            Assert.Equal(1, reader.StopCount);
+            Assert.NotNull(channel);
+            Assert.Equal(1, channel.StopCount);
         }
 
         [Fact]
-        public void Reinitialize_WhenSubclassSkipsClose_StopsPreviousReader()
+        public void Reinitialize_WhenSubclassSkipsClose_StopsPreviousChannel()
         {
-            var readers = new List<RecordingReader>();
+            var channels = new List<RecordingChannel>();
             var targetWrapper = new NoCloseTargetWrapper(new MyTarget()) { Name = "Reinitialize_WhenSubclassSkipsClose_Wrapper" };
-            targetWrapper.ReaderFactory = (consume, timeToSleepBetweenBatches) =>
+            targetWrapper.ChannelFactory = consume =>
             {
-                var reader = new RecordingReader(consume, timeToSleepBetweenBatches);
-                readers.Add(reader);
-                return reader;
+                var channel = new RecordingChannel(consume);
+                channels.Add(channel);
+                return channel;
             };
             try
             {
                 targetWrapper.Initialize(null);
                 targetWrapper.Close();
-                Assert.Equal(0, readers[0].StopCount);
+                Assert.Equal(0, channels[0].StopCount);
 
                 targetWrapper.Initialize(null);
-                Assert.Equal(1, readers[0].StopCount);
-                Assert.Equal(0, readers[1].StopCount);
+                Assert.Equal(1, channels[0].StopCount);
+                Assert.Equal(0, channels[1].StopCount);
             }
             finally
             {
                 targetWrapper.Close();
-                foreach (var reader in readers)
-                    reader.Stop(TimeSpan.Zero);
             }
         }
 
@@ -1133,18 +1130,18 @@ namespace NLog.UnitTests.Targets.Wrappers
             }
         }
 
-        [Theory]
-        [InlineData(false)]
-        [InlineData(true)]
-        public void PeriodicSleep_WritesWithoutSignal(bool dedicatedThread)
+        [Fact]
+        public void TimerByDefault_WithLongSleep_WritesPeriodically()
         {
+            // No explicit dispatcher and TimeToSleepBetweenBatches > 1: the timer channel, as AsyncWrapper always behaved
             var countingTarget = new CountingTarget();
-            var targetWrapper = new AsyncTargetWrapper(countingTarget) { Name = "PeriodicSleep_Wrapper", TimeToSleepBetweenBatches = 50 };
-            UseDispatcher(targetWrapper, dedicatedThread);
+            var targetWrapper = new AsyncTargetWrapper(countingTarget) { Name = "TimerByDefault_Wrapper", TimeToSleepBetweenBatches = 50 };
             countingTarget.Initialize(null);
             targetWrapper.Initialize(null);
             try
             {
+                Assert.IsType<ChannelTimerThread>(GetChannel(targetWrapper));
+
                 for (int i = 0; i < 10; ++i)
                     targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => { }));
 
@@ -1154,6 +1151,213 @@ namespace NLog.UnitTests.Targets.Wrappers
             {
                 targetWrapper.Close();
                 countingTarget.Close();
+            }
+        }
+
+        [Theory]
+        [InlineData(AsyncTargetWrapperDispatcher.ThreadPool)]
+        [InlineData(AsyncTargetWrapperDispatcher.DedicatedThread)]
+        public void SignalDriven_WithLongSleep_WritesAfterFirstWriteDelay(AsyncTargetWrapperDispatcher dispatcher)
+        {
+            // Explicit signal-driven dispatcher: TimeToSleepBetweenBatches is the delay from the first write until writing
+            var countingTarget = new CountingTarget();
+            var targetWrapper = new AsyncTargetWrapper(countingTarget) { Name = "SignalDriven_LongSleep_Wrapper", TimeToSleepBetweenBatches = 300, Dispatcher = dispatcher };
+            countingTarget.Initialize(null);
+            targetWrapper.Initialize(null);
+            try
+            {
+                for (int i = 0; i < 10; ++i)
+                    targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => { }));
+
+                Thread.Sleep(100);
+                Assert.Equal(0, countingTarget.WriteCount);
+                Assert.True(countingTarget.WaitForWrites(10, 5000), $"Written: {countingTarget.WriteCount}");
+            }
+            finally
+            {
+                targetWrapper.Close();
+                countingTarget.Close();
+            }
+        }
+
+        [Theory]
+        [InlineData(null, 1, typeof(ChannelWorkerThread))]
+        [InlineData(null, 0, typeof(ChannelWorkerThread))]
+        [InlineData(null, 50, typeof(ChannelTimerThread))]
+        [InlineData("ThreadPool", 50, typeof(ChannelWorkerThread))]
+        [InlineData("DedicatedThread", 1, typeof(ChannelDedicatedThread))]
+        [InlineData("Timer", 50, typeof(ChannelTimerThread))]
+        [InlineData("Timer", 1, typeof(ChannelWorkerThread))]
+        public void Dispatcher_ResolvesChannelType(string dispatcher, int timeToSleepBetweenBatches, Type expectedChannelType)
+        {
+            var targetWrapper = new AsyncTargetWrapper(new MyTarget()) { Name = "Dispatcher_ResolvesChannelType_Wrapper", TimeToSleepBetweenBatches = timeToSleepBetweenBatches };
+            if (dispatcher != null)
+                targetWrapper.Dispatcher = (AsyncTargetWrapperDispatcher)Enum.Parse(typeof(AsyncTargetWrapperDispatcher), dispatcher);
+
+            targetWrapper.Initialize(null);
+            try
+            {
+                Assert.IsType(expectedChannelType, GetChannel(targetWrapper));
+            }
+            finally
+            {
+                targetWrapper.Close();
+            }
+        }
+
+        [Fact]
+        public void Dispatcher_ExplicitTimerWithShortSleep_LogsWarning()
+        {
+            var targetWrapper = new AsyncTargetWrapper(new MyTarget()) { Name = "Dispatcher_TimerShortSleep_Wrapper", TimeToSleepBetweenBatches = 1, Dispatcher = AsyncTargetWrapperDispatcher.Timer };
+
+            string internalLog = RunAndCaptureInternalLog(() =>
+            {
+                targetWrapper.Initialize(null);
+                targetWrapper.Close();
+            }, LogLevel.Warn);
+
+            Assert.Contains("TimeToSleepBetweenBatches", internalLog);
+        }
+
+        [Fact]
+        public void Dispatcher_NotSet_ReturnsResolvedValue()
+        {
+            Assert.Equal(AsyncTargetWrapperDispatcher.ThreadPool, new AsyncTargetWrapper().Dispatcher);
+            Assert.Equal(AsyncTargetWrapperDispatcher.Timer, new AsyncTargetWrapper { TimeToSleepBetweenBatches = 50 }.Dispatcher);
+        }
+
+        [Fact]
+        public void Consumer_WhenWrappedTargetMissing_ReportsNoProgress()
+        {
+            Func<ChannelConsumeResult> consume = null;
+            var targetWrapper = new AsyncTargetWrapper(new MyTarget()) { Name = "Consumer_WrappedTargetMissing_Wrapper" };
+            targetWrapper.ChannelFactory = c => { consume = c; return new RecordingChannel(c); };
+            targetWrapper.Initialize(null);
+            try
+            {
+                targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => { }));
+                targetWrapper.WrappedTarget = null;
+
+                Assert.Equal(ChannelConsumeResult.NoProgress, consume());
+            }
+            finally
+            {
+                targetWrapper.Close();
+            }
+        }
+
+        [Fact]
+        public void Reinitialize_WhileLogging_LaterEventsWritten()
+        {
+            var countingTarget = new CountingTarget();
+            var targetWrapper = new AsyncTargetWrapper(countingTarget) { Name = "Reinitialize_WhileLogging_Wrapper" };
+            var producerErrors = new List<Exception>();
+            using (new NoThrowNLogExceptions())
+            {
+                countingTarget.Initialize(null);
+                targetWrapper.Initialize(null);
+                try
+                {
+                    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                    var producers = new Thread[4];
+                    for (int i = 0; i < producers.Length; ++i)
+                    {
+                        producers[i] = new Thread(() =>
+                        {
+                            try
+                            {
+                                while (stopwatch.ElapsedMilliseconds < 500)
+                                    targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => { }));
+                            }
+                            catch (Exception ex)
+                            {
+                                lock (producerErrors)
+                                    producerErrors.Add(ex);
+                            }
+                        }) { IsBackground = true };
+                        producers[i].Start();
+                    }
+
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        Thread.Sleep(100);
+                        targetWrapper.Close();
+                        targetWrapper.Initialize(null);
+                    }
+
+                    foreach (var producer in producers)
+                        Assert.True(producer.Join(5000));
+                    Assert.Empty(producerErrors);
+
+                    Thread.Sleep(200);  // Let the last channel drain what the producers wrote
+                    int writtenBefore = countingTarget.WriteCount;
+                    for (int i = 0; i < 10; ++i)
+                        targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => { }));
+
+                    Assert.True(countingTarget.WaitForWrites(writtenBefore + 10, 5000), $"Written: {countingTarget.WriteCount - writtenBefore} of 10");
+                }
+                finally
+                {
+                    targetWrapper.Close();
+                    countingTarget.Close();
+                }
+            }
+        }
+
+        [Fact]
+        public void LogEventDropped_SubscribedAfterInitialize_SurvivesReinitialize()
+        {
+            using (var releaseWrites = new ManualResetEvent(false))
+            {
+                var blockingTarget = new CountingTarget { BlockWrites = releaseWrites };
+                var targetWrapper = new AsyncTargetWrapper(blockingTarget)
+                {
+                    Name = "LogEventDropped_SubscribedAfterInitialize_Wrapper",
+                    QueueLimit = 2,
+                    OverflowAction = AsyncTargetWrapperOverflowAction.Discard,
+                };
+                int droppedCount = 0;
+                blockingTarget.Initialize(null);
+                targetWrapper.Initialize(null);
+                try
+                {
+                    targetWrapper.LogEventDropped += (sender, args) => Interlocked.Increment(ref droppedCount);
+                    targetWrapper.Close();
+                    targetWrapper.Initialize(null);
+
+                    for (int i = 0; i < 5; ++i)
+                        targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => { }));
+
+                    Assert.True(Interlocked.CompareExchange(ref droppedCount, 0, 0) >= 1);
+                }
+                finally
+                {
+                    releaseWrites.Set();
+                    targetWrapper.Close();
+                    blockingTarget.Close();
+                }
+            }
+        }
+
+        [Fact]
+        public void Reinitialize_AppliesChangedQueueSettings()
+        {
+            var targetWrapper = new AsyncTargetWrapper(new MyTarget()) { Name = "Reinitialize_ChangedQueueSettings_Wrapper" };
+            targetWrapper.Initialize(null);
+            targetWrapper.Close();
+
+            targetWrapper.QueueLimit = 7;
+            targetWrapper.OverflowAction = AsyncTargetWrapperOverflowAction.Grow;
+            targetWrapper.Initialize(null);
+            try
+            {
+                var channel = GetChannel(targetWrapper);
+                Assert.Equal(7, channel.QueueLimit);
+                Assert.Equal(AsyncTargetWrapperOverflowAction.Grow, channel.OverflowAction);
+            }
+            finally
+            {
+                targetWrapper.Close();
             }
         }
 
@@ -1234,33 +1438,37 @@ namespace NLog.UnitTests.Targets.Wrappers
             }
         }
 
-        private class RecordingReader : IChannelReader
+        /// <summary>
+        /// Channel that never runs the consumer by itself: counts Stop calls and can fail on Start.
+        /// </summary>
+        private class RecordingChannel : AsyncLogEventChannel
         {
-            private readonly ThreadPoolChannelReader _inner;
             private int _stopCount;
 
-            public RecordingReader(Func<ConsumeResult> consume, int timeToSleepBetweenBatches)
+            public RecordingChannel(Func<ChannelConsumeResult> consume)
+                : base(10000, AsyncTargetWrapperOverflowAction.Discard, consume)
             {
-                _inner = new ThreadPoolChannelReader(consume, timeToSleepBetweenBatches, "test");
             }
 
             public bool ThrowOnStart { get; set; }
 
             public int StopCount => Interlocked.CompareExchange(ref _stopCount, 0, 0);
 
-            public void Start()
+            public override void Start()
             {
                 if (ThrowOnStart)
                     throw new ApplicationException("start failure");
-                _inner.Start();
             }
 
-            public void Signal() => _inner.Signal();
-
-            public bool Stop(TimeSpan timeout)
+            public override bool Stop(TimeSpan timeout)
             {
                 Interlocked.Increment(ref _stopCount);
-                return _inner.Stop(timeout);
+                return true;
+            }
+
+            protected override void OnFirstWrite()
+            {
+                // Tests invoke the consumer themselves
             }
         }
 

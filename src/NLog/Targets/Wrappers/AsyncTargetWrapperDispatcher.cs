@@ -39,15 +39,23 @@ namespace NLog.Targets.Wrappers
     public enum AsyncTargetWrapperDispatcher
     {
         /// <summary>
-        /// Write queued log events from a timer callback on the .NET ThreadPool.
+        /// Write queued log events on the .NET ThreadPool, driven by writes: the first write into an empty queue starts
+        /// writing after <see cref="AsyncTargetWrapper.TimeToSleepBetweenBatches"/>, then it writes until the queue is empty.
         /// </summary>
-        ThreadPool,
+        ThreadPool = 0,
 
         /// <summary>
         /// Write queued log events on a dedicated background thread owned by the target,
-        /// so logging keeps working when the .NET ThreadPool is starved.
+        /// so logging keeps working when the .NET ThreadPool is starved. Driven by writes, like <see cref="ThreadPool"/>.
         /// Costs one thread per <see cref="AsyncTargetWrapper"/>.
         /// </summary>
-        DedicatedThread,
+        DedicatedThread = 1,
+
+        /// <summary>
+        /// Write queued log events on the .NET ThreadPool on a fixed schedule: wake up every
+        /// <see cref="AsyncTargetWrapper.TimeToSleepBetweenBatches"/> milliseconds and write what is queued. Writes do not trigger it.
+        /// Requires <see cref="AsyncTargetWrapper.TimeToSleepBetweenBatches"/> above 1 ms.
+        /// </summary>
+        Timer = 2,
     }
 }

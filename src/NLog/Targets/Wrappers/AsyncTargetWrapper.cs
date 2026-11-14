@@ -38,7 +38,6 @@ namespace NLog.Targets.Wrappers
     using System.Threading;
     using NLog.Common;
     using NLog.Internal;
-    using NLog.Targets.Dispatchers;
 
     /// <summary>
     /// Provides asynchronous, buffered execution of target writes.
@@ -97,8 +96,7 @@ namespace NLog.Targets.Wrappers
     public class AsyncTargetWrapper : WrapperTargetBase
     {
         private readonly object _writeLockObject = new object();
-        private readonly AsyncLogEventChannel _channel;
-        private IChannelReader? _reader;
+        private AsyncLogEventChannel _channel;
         private readonly ReusableAsyncLogEventList _reusableAsyncLogEventList = new ReusableAsyncLogEventList(200);
         private readonly WaitCallback _flushEventsInQueueDelegate;
         private event EventHandler<LogEventDroppedEventArgs>? _logEventDroppedEvent;
@@ -110,7 +108,7 @@ namespace NLog.Targets.Wrappers
         /// </summary>
         public AsyncTargetWrapper()
         {
-            _channel = new ChannelWorkerThread(10000, AsyncTargetWrapperOverflowAction.Discard, () => ChannelConsumeResult.Empty, 1, "AsyncWrapper");
+            _channel = new ChannelWorkerThread(10000, AsyncTargetWrapperOverflowAction.Discard, WritePendingEvents, 1, "AsyncWrapper");
             _flushEventsInQueueDelegate = FlushEventsInQueue;
         }
 
@@ -253,22 +251,32 @@ namespace NLog.Targets.Wrappers
         private bool? _forceLockingQueue;
 
         /// <summary>
-        /// Gets or sets where the background writer runs: on the .NET ThreadPool, or on a dedicated thread owned by this target.
+        /// Gets or sets how the background writer runs, and with it the meaning of <see cref="TimeToSleepBetweenBatches"/>.
         /// </summary>
         /// <remarks>
-        /// Default: <see cref="AsyncTargetWrapperDispatcher.ThreadPool"/> .
+        /// Default: <see cref="AsyncTargetWrapperDispatcher.ThreadPool"/> , or <see cref="AsyncTargetWrapperDispatcher.Timer"/>
+        /// when <see cref="TimeToSleepBetweenBatches"/> is above 1 ms and no dispatcher is assigned.
+        /// <see cref="AsyncTargetWrapperDispatcher.ThreadPool"/> and <see cref="AsyncTargetWrapperDispatcher.DedicatedThread"/> start
+        /// writing <see cref="TimeToSleepBetweenBatches"/> after the first write into an empty queue, and write until it is empty.
+        /// <see cref="AsyncTargetWrapperDispatcher.Timer"/> writes every <see cref="TimeToSleepBetweenBatches"/>, and needs more than 1 ms
+        /// (with 1 ms or less it falls back to <see cref="AsyncTargetWrapperDispatcher.ThreadPool"/> and logs a warning).
         /// Use <see cref="AsyncTargetWrapperDispatcher.DedicatedThread"/> to keep writing when the .NET ThreadPool is starved,
         /// which matters most with <see cref="AsyncTargetWrapperOverflowAction.Block"/>. Costs one thread per target.
         /// Applied when the target is initialized.
         /// </remarks>
         /// <docgen category='Buffering Options' order='100' />
-        public AsyncTargetWrapperDispatcher Dispatcher { get; set; }
+        public AsyncTargetWrapperDispatcher Dispatcher
+        {
+            get => _dispatcher ?? (TimeToSleepBetweenBatches > 1 ? AsyncTargetWrapperDispatcher.Timer : AsyncTargetWrapperDispatcher.ThreadPool);
+            set => _dispatcher = value;
+        }
+        private AsyncTargetWrapperDispatcher? _dispatcher;
 
         /// <summary>
-        /// Overrides <see cref="Dispatcher"/> with a custom <see cref="IChannelReader"/>, created from the consumer
-        /// and <see cref="TimeToSleepBetweenBatches"/>. A new reader is created on every initialize.
+        /// Overrides <see cref="Dispatcher"/> with a custom <see cref="AsyncLogEventChannel"/>, created from the consumer.
+        /// A new channel is created on every initialize.
         /// </summary>
-        internal Func<Func<ConsumeResult>, int, IChannelReader>? ReaderFactory { get; set; }
+        internal Func<Func<ChannelConsumeResult>, AsyncLogEventChannel>? ChannelFactory { get; set; }
 
         /// <summary>
         /// Schedules a flush of pending events in the queue (if any), followed by flushing the WrappedTarget.
@@ -280,7 +288,7 @@ namespace NLog.Targets.Wrappers
         }
 
         /// <summary>
-        /// Initializes the target by starting the channel reader, which writes queued log events in the background.
+        /// Initializes the target by starting the channel, which writes queued log events in the background.
         /// </summary>
         protected override void InitializeTarget()
         {
@@ -289,11 +297,6 @@ namespace NLog.Targets.Wrappers
             if (!ForceLockingQueue && OverflowAction == AsyncTargetWrapperOverflowAction.Block && BatchSize * 1.5m > QueueLimit)
             {
                 ForceLockingQueue = true;   // ConcurrentQueue does not perform well if constantly hitting QueueLimit
-            }
-
-            if (_forceLockingQueue.HasValue)
-            {
-                _channel.UseLockingQueue(_forceLockingQueue.Value);    // Only when set, otherwise keep the default queue for the platform
             }
 
             if (BatchSize > QueueLimit && TimeToSleepBetweenBatches <= 1)
@@ -309,43 +312,80 @@ namespace NLog.Targets.Wrappers
                 InternalLogger.Debug("{0} WrappedTarget has unresolved missing dependencies.", this);
             }
 
-            _channel.Clear();
-            InternalLogger.Trace("{0}: Start channel reader", this);
-            var reader = CreateReader();
+            // A new channel on every initialize, keeping the queue settings and event subscriptions of the previous one
+            var previousChannel = _channel;
+            var channel = CreateChannel();
+            channel.QueueLimit = previousChannel.QueueLimit;
+            channel.OverflowAction = previousChannel.OverflowAction;
+            if (_forceLockingQueue.HasValue)
+            {
+                channel.UseLockingQueue(_forceLockingQueue.Value);    // Only when set, otherwise keep the default queue for the platform
+            }
+            MoveEventSubscriptions(previousChannel, channel);
+
+            InternalLogger.Trace("{0}: Start {1}", this, channel.GetType().Name);
+            Interlocked.Exchange(ref _channel, channel);
 
             // Still running when a subclass skipped base.CloseTarget on close. A dedicated thread would otherwise leak.
-            Interlocked.Exchange(ref _reader, reader)?.Stop(TimeSpan.Zero);
+            previousChannel.Stop(TimeSpan.Zero);
+            previousChannel.Clear();    // Releases writers blocked by OverflowAction.Block on the previous queue
 
             try
             {
-                reader.Start();
+                channel.Start();
             }
             catch
             {
-                // Target.Close skips CloseTarget after failed initialize, so stop the reader here
-                Interlocked.CompareExchange(ref _reader, null, reader);
-                reader.Stop(TimeSpan.Zero);
+                // Target.Close skips CloseTarget after failed initialize, so stop the channel here
+                channel.Stop(TimeSpan.Zero);
                 throw;
             }
         }
 
-        private IChannelReader CreateReader()
+        private AsyncLogEventChannel CreateChannel()
         {
-            if (ReaderFactory != null)
-                return ReaderFactory(ConsumePendingEvents, TimeToSleepBetweenBatches);
+            if (ChannelFactory != null)
+                return ChannelFactory(WritePendingEvents);
 
-            if (Dispatcher == AsyncTargetWrapperDispatcher.DedicatedThread)
-                return new DedicatedThreadChannelReader(ConsumePendingEvents, TimeToSleepBetweenBatches, "NLog AsyncWrapper " + Name);
+            var dispatcher = Dispatcher;
+            if (dispatcher == AsyncTargetWrapperDispatcher.Timer && TimeToSleepBetweenBatches <= 1)
+            {
+                InternalLogger.Warn("{0}: Dispatcher=Timer needs TimeToSleepBetweenBatches above 1 ms (is {1}), so ThreadPool is used instead.", this, TimeToSleepBetweenBatches);
+                dispatcher = AsyncTargetWrapperDispatcher.ThreadPool;
+            }
 
-            return new ThreadPoolChannelReader(ConsumePendingEvents, TimeToSleepBetweenBatches, ToString());
+            switch (dispatcher)
+            {
+                case AsyncTargetWrapperDispatcher.DedicatedThread:
+                    return new ChannelDedicatedThread(QueueLimit, OverflowAction, WritePendingEvents, TimeToSleepBetweenBatches, "NLog AsyncWrapper " + Name);
+                case AsyncTargetWrapperDispatcher.Timer:
+                    return new ChannelTimerThread(QueueLimit, OverflowAction, WritePendingEvents, TimeToSleepBetweenBatches, ToString());
+                default:
+                    return new ChannelWorkerThread(QueueLimit, OverflowAction, WritePendingEvents, TimeToSleepBetweenBatches, ToString());
+            }
+        }
+
+        private void MoveEventSubscriptions(AsyncLogEventChannel previousChannel, AsyncLogEventChannel channel)
+        {
+            if (_logEventDroppedEvent != null)
+            {
+                previousChannel.LogEventDropped -= OnRequestQueueDropItem;
+                channel.LogEventDropped += OnRequestQueueDropItem;
+            }
+
+            if (_eventQueueGrowEvent != null)
+            {
+                previousChannel.LogEventQueueGrow -= OnRequestQueueGrow;
+                channel.LogEventQueueGrow += OnRequestQueueGrow;
+            }
         }
 
         /// <summary>
-        /// Stops the channel reader, and writes the remaining queued log events.
+        /// Stops the channel, and writes the remaining queued log events.
         /// </summary>
         protected override void CloseTarget()
         {
-            Interlocked.Exchange(ref _reader, null)?.Stop(TimeSpan.FromSeconds(1));
+            _channel.Stop(TimeSpan.FromSeconds(1));
 
             var lockTimeoutMs = OverflowAction == AsyncTargetWrapperOverflowAction.Discard ? 500 : 1500;
             if (Monitor.TryEnter(_writeLockObject, lockTimeoutMs))
@@ -374,7 +414,7 @@ namespace NLog.Targets.Wrappers
 
         /// <summary>
         /// Adds the log event to asynchronous queue to be processed by
-        /// the channel reader in the background.
+        /// the channel in the background.
         /// </summary>
         /// <param name="logEvent">The log event.</param>
         /// <remarks>
@@ -384,11 +424,7 @@ namespace NLog.Targets.Wrappers
         protected override void Write(AsyncLogEventInfo logEvent)
         {
             PrecalculateVolatileLayouts(logEvent.LogEvent);
-            if (_channel.Write(logEvent))
-            {
-                // Queue was empty, so tell the reader there is work. Otherwise a consumer run is already on its way.
-                _reader?.Signal();
-            }
+            _channel.Write(logEvent);   // The channel decides when to write it
         }
 
         /// <summary>
@@ -423,21 +459,18 @@ namespace NLog.Targets.Wrappers
         }
 
         /// <summary>
-        /// Consumer run, called by the channel reader: writes queued log events and reports what it found.
-        /// Makes no scheduling decision, the reader decides when to run it next.
+        /// Consumer run, called by the channel: writes at most <see cref="FullBatchSizeWriteLimit"/> batches and reports what it found.
+        /// Makes no scheduling decision, the channel decides when to run it next.
         /// </summary>
-        private ConsumeResult ConsumePendingEvents()
+        private ChannelConsumeResult WritePendingEvents()
         {
-            if (_reader is null)
-                return ConsumeResult.Drained;   // Closed
-
             try
             {
                 lock (_writeLockObject)
                 {
-                    int lastBatchSize = WriteLogEventsInQueue(BatchSize, "Timer");
-                    if (lastBatchSize == BatchSize)
-                        return ConsumeResult.FullBatch;     // Found full batch, so more is probably queued: run again right away
+                    int written = WriteLogEventsInQueue(BatchSize, "Timer");
+                    if (written == 0 && !_channel.IsEmpty)
+                        return ChannelConsumeResult.NoProgress;     // No wrapped target, or it waits for a missing dependency
                 }
             }
             catch (Exception exception)
@@ -448,11 +481,10 @@ namespace NLog.Targets.Wrappers
                     throw;  // Throwing exceptions here will crash the entire application (.NET 2.0 behavior)
                 }
 #endif
-                InternalLogger.Error(exception, "{0}: Error in lazy writer procedure.", this);  // Something went wrong, let the reader throttle the retry
+                InternalLogger.Error(exception, "{0}: Error in lazy writer procedure.", this);
             }
 
-            // More might have arrived while writing the last batch. Let the reader throttle, so it is written as a larger batch.
-            return _channel.IsEmpty ? ConsumeResult.Drained : ConsumeResult.MorePending;
+            return _channel.IsEmpty ? ChannelConsumeResult.Empty : ChannelConsumeResult.MoreQueued;
         }
 
         private void FlushEventsInQueue(object? state)
@@ -479,9 +511,9 @@ namespace NLog.Targets.Wrappers
                 finally
                 {
                     Monitor.Exit(_writeLockObject);
-                    if (TimeToSleepBetweenBatches <= 1 && !_channel.IsEmpty)
+                    if (!_channel.IsEmpty)
                     {
-                        _reader?.Signal();  // More arrived while flushing
+                        _channel.NotifyPendingEvents();     // More arrived while flushing
                     }
                 }
             }
@@ -517,22 +549,24 @@ namespace NLog.Targets.Wrappers
             }
             else
             {
-                int lastBatchSize = 0;
+                int totalWritten = 0;
 
                 for (int i = 0; i < FullBatchSizeWriteLimit; ++i)
                 {
+                    int batchWritten;
                     using (var targetList = _reusableAsyncLogEventList.Allocate())
                     {
                         var logEvents = targetList.Result;
                         _channel.ReadBatch(batchSize, logEvents);
-                        lastBatchSize = WriteLogEventsToTarget(logEvents, reason);
+                        batchWritten = WriteLogEventsToTarget(logEvents, reason);
                     }
 
-                    if (lastBatchSize < batchSize)
+                    totalWritten += batchWritten;
+                    if (batchWritten < batchSize)
                         break;
                 }
 
-                return lastBatchSize;
+                return totalWritten;
             }
         }
 
