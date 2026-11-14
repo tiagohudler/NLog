@@ -36,18 +36,20 @@ namespace NLog.Targets.Wrappers
     using System;
     using System.Collections.Generic;
     using NLog.Common;
+    using NLog.Internal;
 
     /// <summary>
     /// Bounded channel between the logger threads that write log events (producers)
-    /// and the single consumer that reads them in batches for <see cref="AsyncTargetWrapper"/>.
+    /// and the single consumer that writes them in batches for <see cref="AsyncTargetWrapper"/>.
     /// </summary>
     /// <remarks>
     /// Owns the request queue, which applies <see cref="QueueLimit"/> and <see cref="OverflowAction"/>.
-    /// The channel is passive: it never calls the consumer, the caller of <see cref="Write"/> decides what to do
-    /// when the queue was empty.
+    /// Each subclass decides when the consumer runs: <see cref="ChannelWorkerThread"/> (ThreadPool, after the first write),
+    /// <c>ChannelTimerThread</c> (ThreadPool, periodic) and <see cref="ChannelDedicatedThread"/> (own thread, after the first write).
     /// </remarks>
-    internal sealed class AsyncLogEventChannel
+    internal abstract class AsyncLogEventChannel
     {
+        private readonly Func<ChannelConsumeResult> _consume;
         private AsyncRequestQueueBase _queue;
         private EventHandler<LogEventDroppedEventArgs>? _logEventDropped;
         private EventHandler<LogEventQueueGrowEventArgs>? _logEventQueueGrow;
@@ -57,8 +59,10 @@ namespace NLog.Targets.Wrappers
         /// </summary>
         /// <param name="queueLimit">Maximum number of log events in the queue.</param>
         /// <param name="overflowAction">The action to be taken when the queue overflows.</param>
-        public AsyncLogEventChannel(int queueLimit, AsyncTargetWrapperOverflowAction overflowAction)
+        /// <param name="consume">Writes queued log events (at most FullBatchSizeWriteLimit batches), and reports what it found.</param>
+        protected AsyncLogEventChannel(int queueLimit, AsyncTargetWrapperOverflowAction overflowAction, Func<ChannelConsumeResult> consume)
         {
+            _consume = consume ?? throw new ArgumentNullException(nameof(consume));
 #if NETFRAMEWORK
             _queue = new AsyncRequestQueue(queueLimit, overflowAction);
 #else
@@ -175,7 +179,54 @@ namespace NLog.Targets.Wrappers
         /// </summary>
         /// <param name="logEvent">The log event.</param>
         /// <returns><see langword="true"/> when the queue was empty before the write.</returns>
-        public bool Write(AsyncLogEventInfo logEvent) => _queue.Enqueue(logEvent);
+        public bool Write(AsyncLogEventInfo logEvent)
+        {
+            bool queueWasEmpty = _queue.Enqueue(logEvent);
+            if (queueWasEmpty)
+                OnFirstWrite();
+            return queueWasEmpty;
+        }
+
+        /// <summary>
+        /// Starts draining the queue in the background.
+        /// </summary>
+        public abstract void Start();
+
+        /// <summary>
+        /// Stops draining the queue, and waits for a consumer run in progress to complete.
+        /// </summary>
+        /// <param name="timeout">How long to wait for a consumer run in progress.</param>
+        /// <returns><see langword="true"/> when fully stopped within <paramref name="timeout"/>. Calling it again returns <see langword="true"/>.</returns>
+        public abstract bool Stop(TimeSpan timeout);
+
+        /// <summary>
+        /// Tells the channel that log events are queued, as a first write would (after a Flush that left events queued).
+        /// </summary>
+        public void NotifyPendingEvents() => OnFirstWrite();
+
+        /// <summary>
+        /// Called when a write found the queue empty. Cheap and safe to call from any thread.
+        /// </summary>
+        protected abstract void OnFirstWrite();
+
+        /// <summary>
+        /// Runs the consumer. Exceptions are logged, and reported from <see cref="IsEmpty"/>; fatal exceptions are rethrown.
+        /// </summary>
+        protected ChannelConsumeResult RunConsumer()
+        {
+            try
+            {
+                return _consume();
+            }
+            catch (Exception ex)
+            {
+                if (ex.MustBeRethrownImmediately())
+                    throw;
+
+                InternalLogger.Error(ex, "{0}: Error in channel consumer.", this);
+                return IsEmpty ? ChannelConsumeResult.Empty : ChannelConsumeResult.MoreQueued;
+            }
+        }
 
         /// <summary>
         /// Reads at most <paramref name="count"/> log events into a preallocated list.

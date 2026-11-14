@@ -45,7 +45,8 @@ namespace NLog.UnitTests.Targets.Wrappers
 
         private static AsyncLogEventChannel CreateChannel(int queueLimit, AsyncTargetWrapperOverflowAction overflowAction, bool lockingQueue)
         {
-            var channel = new AsyncLogEventChannel(queueLimit, overflowAction);
+            // Queue behavior lives in the abstract base; a channel that is never started exercises only the queue
+            AsyncLogEventChannel channel = new ChannelWorkerThread(queueLimit, overflowAction, () => ChannelConsumeResult.Empty, 1, "test");
             channel.UseLockingQueue(lockingQueue);
             return channel;
         }

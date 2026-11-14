@@ -110,7 +110,7 @@ namespace NLog.Targets.Wrappers
         /// </summary>
         public AsyncTargetWrapper()
         {
-            _channel = new AsyncLogEventChannel(10000, AsyncTargetWrapperOverflowAction.Discard);
+            _channel = new ChannelWorkerThread(10000, AsyncTargetWrapperOverflowAction.Discard, () => ChannelConsumeResult.Empty, 1, "AsyncWrapper");
             _flushEventsInQueueDelegate = FlushEventsInQueue;
         }
 
