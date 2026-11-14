@@ -239,7 +239,9 @@ namespace NLog.UnitTests.Targets.Wrappers
 
                 int count = Read(ref runs);
                 Assert.True(count >= 2, $"Runs: {count}");
-                Assert.True(count <= 250, $"Runs: {count}");
+                // Retry after 1 ms: at most ~500 runs in 500 ms where timers tick every 1 ms (Linux with 1000 Hz kernel), ~32 on Windows (15.6 ms).
+                // A busy loop makes tens of thousands.
+                Assert.True(count <= 1500, $"Runs: {count}");
             }
             finally
             {

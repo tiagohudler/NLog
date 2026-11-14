@@ -1289,12 +1289,15 @@ namespace NLog.UnitTests.Targets.Wrappers
                         Assert.True(producer.Join(5000));
                     Assert.Empty(producerErrors);
 
-                    Thread.Sleep(200);  // Let the last channel drain what the producers wrote
-                    int writtenBefore = countingTarget.WriteCount;
+                    // Count only the later events, by their own continuations (leftover producer events may still be draining)
+                    int laterWritten = 0;
                     for (int i = 0; i < 10; ++i)
-                        targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => { }));
+                        targetWrapper.WriteAsyncLogEvent(LogEventInfo.CreateNullEvent().WithContinuation(ex => Interlocked.Increment(ref laterWritten)));
 
-                    Assert.True(countingTarget.WaitForWrites(writtenBefore + 10, 5000), $"Written: {countingTarget.WriteCount - writtenBefore} of 10");
+                    var waitLater = System.Diagnostics.Stopwatch.StartNew();
+                    while (Interlocked.CompareExchange(ref laterWritten, 0, 0) < 10 && waitLater.ElapsedMilliseconds < 5000)
+                        Thread.Sleep(10);
+                    Assert.Equal(10, Interlocked.CompareExchange(ref laterWritten, 0, 0));
                 }
                 finally
                 {

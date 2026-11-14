@@ -115,6 +115,9 @@ namespace NLog.Targets.Wrappers
             if (!started || ReferenceEquals(_thread, Thread.CurrentThread))
                 return true;    // Never started, or Stop called from inside the consumer (avoid self-join)
 
+            if ((_thread.ThreadState & ThreadState.Unstarted) != 0)
+                return true;    // Thread.Start failed (or has not run yet); once started it sees _stopped and exits
+
             return _thread.Join(timeout);
         }
 

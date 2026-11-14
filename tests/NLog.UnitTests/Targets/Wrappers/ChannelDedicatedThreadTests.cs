@@ -88,5 +88,17 @@ namespace NLog.UnitTests.Targets.Wrappers
                 Assert.False(consumerThread.IsAlive);
             }
         }
+
+        [Fact]
+        public void Stop_WhenThreadStartFailed_DoesNotThrow()
+        {
+            var channel = CreateChannel(() => ChannelConsumeResult.Empty, 1);
+
+            // Same state as when Thread.Start throws (out of memory): marked as started, thread never started
+            typeof(ChannelDedicatedThread).GetField("_started", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).SetValue(channel, true);
+
+            Assert.True(channel.Stop(TimeSpan.Zero));
+            Assert.True(channel.Stop(TimeSpan.Zero));
+        }
     }
 }

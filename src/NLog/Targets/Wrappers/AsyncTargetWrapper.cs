@@ -156,7 +156,10 @@ namespace NLog.Targets.Wrappers
         public int BatchSize { get; set; } = 200;
 
         /// <summary>
-        /// Gets or sets the time in milliseconds to sleep between batches. (1 or less means trigger on new activity)
+        /// Gets or sets the time in milliseconds to wait before writing queued log events. With <see cref="AsyncTargetWrapperDispatcher.ThreadPool"/>
+        /// and <see cref="AsyncTargetWrapperDispatcher.DedicatedThread"/> it is the delay after a log event arrives in an empty queue (then the queue
+        /// is written until empty). With <see cref="AsyncTargetWrapperDispatcher.Timer"/> it is the interval between periodic writes.
+        /// Values above 1 select <see cref="AsyncTargetWrapperDispatcher.Timer"/> when <see cref="Dispatcher"/> is not set.
         /// </summary>
         /// <remarks>Default: <see langword="1"/>ms</remarks>
         /// <docgen category='Buffering Options' order='100' />
@@ -236,7 +239,9 @@ namespace NLog.Targets.Wrappers
         }
 
         /// <summary>
-        /// Gets or sets the number of batches of <see cref="BatchSize"/> to write before yielding into <see cref="TimeToSleepBetweenBatches"/>
+        /// Gets or sets the number of batches of <see cref="BatchSize"/> to write in one run. When log events are still queued after a run,
+        /// <see cref="AsyncTargetWrapperDispatcher.ThreadPool"/> continues right away in a new ThreadPool callback, <see cref="AsyncTargetWrapperDispatcher.DedicatedThread"/>
+        /// continues right away on its thread, and <see cref="AsyncTargetWrapperDispatcher.Timer"/> waits for its next interval.
         /// </summary>
         /// <remarks>Default: <see langword="10"/> . Better performance when writing small batches, than single large batch.</remarks>
         /// <docgen category='Buffering Options' order='100' />
