@@ -186,7 +186,7 @@ namespace NLog.UnitTests.Targets.Wrappers
             channel.Write(NewEvent("2"));
             channel.Write(NewEvent("3"));
 
-            Assert.Equal(!lockingQueue, channel.IsLockingQueue);
+            Assert.Equal(ExpectedLockingQueue(!lockingQueue), channel.IsLockingQueue);
             Assert.Equal(1, droppedCount);
         }
 
@@ -201,9 +201,22 @@ namespace NLog.UnitTests.Targets.Wrappers
 
             channel.UseLockingQueue(!lockingQueue);
 
-            Assert.Equal(!lockingQueue, channel.IsLockingQueue);
+            Assert.Equal(ExpectedLockingQueue(!lockingQueue), channel.IsLockingQueue);
             Assert.Equal(7, channel.QueueLimit);
             Assert.Equal(AsyncTargetWrapperOverflowAction.Block, channel.OverflowAction);
+        }
+
+        /// <summary>
+        /// The queue type NLog actually uses when <paramref name="requestedLocking"/> is requested:
+        /// .NET 3.5 has no lock-free ConcurrentRequestQueue, so there it always uses the locking queue.
+        /// </summary>
+        internal static bool ExpectedLockingQueue(bool requestedLocking)
+        {
+#if NET35
+            return true;
+#else
+            return requestedLocking;
+#endif
         }
     }
 }

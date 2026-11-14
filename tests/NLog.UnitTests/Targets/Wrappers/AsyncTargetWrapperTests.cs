@@ -1079,7 +1079,7 @@ namespace NLog.UnitTests.Targets.Wrappers
             targetWrapper.Initialize(null);
             try
             {
-                Assert.Equal(forceLockingQueue, GetChannel(targetWrapper).IsLockingQueue);
+                Assert.Equal(AsyncLogEventChannelTests.ExpectedLockingQueue(forceLockingQueue), GetChannel(targetWrapper).IsLockingQueue);
             }
             finally
             {
