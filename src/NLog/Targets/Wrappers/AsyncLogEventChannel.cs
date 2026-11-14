@@ -45,7 +45,7 @@ namespace NLog.Targets.Wrappers
     /// <remarks>
     /// Owns the request queue, which applies <see cref="QueueLimit"/> and <see cref="OverflowAction"/>.
     /// Each subclass decides when the consumer runs: <see cref="ChannelWorkerThread"/> (ThreadPool, after the first write),
-    /// <c>ChannelTimerThread</c> (ThreadPool, periodic) and <see cref="ChannelDedicatedThread"/> (own thread, after the first write).
+    /// <see cref="ChannelTimerThread"/> (ThreadPool, periodic) and <see cref="ChannelDedicatedThread"/> (own thread, after the first write).
     /// </remarks>
     internal abstract class AsyncLogEventChannel
     {
